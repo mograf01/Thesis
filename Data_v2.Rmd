@@ -1,0 +1,556 @@
+---
+title: "Data_v2_characteristic_value"
+output: html_document
+date: "2023-05-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r Implement the Data in R and set a date region}
+# Lade die Daten
+library(tidyverse)                      # Activate the data science package
+library(lubridate)                      # Activate the date management package
+library(tidyr)
+library(dplyr)
+data <- read.csv("/Users/moritzgraf/Documents/Master Thesis/Data/Code+Data JF/Data/hml.csv", stringsAsFactors = FALSE)
+data <- data %>% 
+    filter(eom >= "2000-01-31",         # Keep the date with sufficient data points
+           eom <= "2020-12-31") %>%
+    arrange(excntry, eom, characteristic)   # Order the data
+
+```
+
+```{r}
+mydata <- data
+# create a dataframe with all possible combinations of name, date and location
+all_combinations <- expand.grid(excntry = unique(mydata$excntry),
+                                eom = unique(mydata$eom),
+                                characteristic = unique(mydata$characteristic))
+
+# join with original data to get the ret values
+new_data <- all_combinations %>%
+  left_join(mydata, by = c("excntry", "eom", "characteristic")) %>%
+  select(excntry, eom, characteristic, signal)
+
+# group by location and name to check for missing dates
+missing_dates <- new_data %>%
+  group_by(excntry, characteristic) %>%
+  summarize(missing_count = sum(is.na(signal))) %>%
+  filter(missing_count > 0) %>%
+  select(excntry, characteristic)
+
+# filter out the locations with missing dates
+new_data_filtered <- anti_join(new_data, missing_dates, by = c("excntry", "characteristic"))
+
+# pivot wider to get the desired format
+new_data_wide <- new_data_filtered %>%
+  pivot_wider(names_from = characteristic, values_from = signal, values_fill = 0) #Still have the struggle that I have lots of NAs even when my data set has none before the "wide" function
+
+sum(is.na(new_data_wide))
+
+
+
+mydata <- new_data_wide %>%
+  arrange(excntry, eom)
+```
+
+#add return data and then join the vw_ret to the new data
+
+```{r}
+# Market Returns
+library(data.table)
+market_returns <- fread("/Users/moritzgraf/Documents/Master Thesis/Data/Code+Data JF/Data/market_returns.csv", colClasses = c("eom"="character"))
+
+#market_returns[, eom := eom %>% as.Date(format = "%Y-%m-%d")]
+market_returns <- market_returns[, .(excntry, eom, mkt_vw_exc, mkt_ew_exc)]
+
+
+
+market_returns <- market_returns %>% 
+    filter(eom >= "1999-05-31",         # Keep the date with sufficient data points
+           eom <= "2022-12-31") %>%
+    arrange(excntry, eom, mkt_vw_exc) #%>%
+  #mutate(mkt_vw_exc_lag = lag(mkt_vw_exc, default = first(mkt_vw_exc)), #Lag returns for vw
+         #mkt_ew_exc_lag = lag(mkt_ew_exc, default = first(mkt_ew_exc))) #Lag returns for ew
+
+
+#Join Data 
+new_data <- mydata %>%
+  left_join(market_returns, by = c("eom", "excntry")) 
+
+new_data[1:6, 1:6] 
+```
+
+```{r}
+new_data$eom <- as.Date(new_data$eom) # Convert to Date class
+new_data  %>% 
+    group_by(eom) %>%                                   # Group by date
+    summarize(nb_assets = excntry %>%                   # Count nb assets
+                  as.factor() %>% nlevels()) %>%
+    ggplot(aes(x = eom, y = nb_assets)) + geom_col() +  # Plot
+    theme_light() +  
+  scale_x_date(date_breaks = "2 year", date_labels = "%Y") 
+```
+
+```{r #Features}
+features <- colnames(new_data[3:155]) # Keep the feature's column names (hard-coded, beware!)
+features_short <- c("market_equity", "prc", "ret_6_1", "chcsho_12m", 
+                    "be_me", "pi_nix", "sale_gr1")
+```
+
+```{r}
+new_data %>%
+    filter(eom == "2015-06-30") %>%
+    ggplot(aes(x = be_me)) + geom_histogram(bins = 50) + 
+    theme_light() + coord_fixed(0.5)
+```
+
+```{r}
+separation_date <- as.Date("2014-01-15")
+training_sample <- filter(new_data, eom < separation_date)
+testing_sample <- filter(new_data, eom >= separation_date)
+```
+
+#Keep returns in a seperate data 
+```{r}
+returns <- new_data %>%                         
+    select(eom, excntry, mkt_vw_exc) %>% # 2. Keep returns along with dates & firm names
+    pivot_wider(names_from = "excntry", 
+                values_from = "mkt_vw_exc")         # 3. Put in matrix shape 
+```
+
+
+
+#TEST
+```{r}
+# Split the data into training and testing samples based on separation_date
+training_sample <- filter(new_data, eom < separation_date)
+testing_sample <- filter(new_data, eom >= separation_date)
+
+# Prepare the dependent variable and predictors for the training sample
+y_penalized_train <- training_sample$mkt_vw_exc_lag
+x_penalized_train <- training_sample %>% 
+  dplyr::select(all_of(features)) %>% as.matrix()
+
+# Fit the LASSO regression model on the training sample
+fit_lasso <- glmnet(x_penalized_train, y_penalized_train, alpha = 1)
+
+# Prepare the predictors for the testing sample
+x_penalized_test <- testing_sample %>% 
+  dplyr::select(all_of(features)) %>% as.matrix()
+
+# Predict the target variable for the testing sample
+y_predicted_test <- predict(fit_lasso, newx = x_penalized_test)
+
+# Calculate the R2 coefficient for the testing sample
+r_squared <- 1 - sum((testing_sample$mkt_vw_exc_lag - y_predicted_test)^2) / sum((testing_sample$mkt_vw_exc_lag - mean(testing_sample$mkt_vw_exc_lag))^2)
+
+# Print the R2 coefficient
+print(paste("R2 coefficient:", r_squared))
+
+# Prepare the data for plotting R2 over time
+r2_data <- data.frame(Date = testing_sample$eom, R2 = r_squared)
+
+# Plot R2 over time
+library(ggplot2)
+ggplot(r2_data, aes(x = Date, y = R2)) +
+  geom_line() +
+  xlab("Date") +
+  ylab("R2 Coefficient")
+```
+
+
+#Penalized Regression
+```{r}
+library(glmnet) 
+y_penalized <- new_data$mkt_vw_exc                           # Dependent variable
+x_penalized <- new_data %>%                                  # Predictors
+    dplyr::select(all_of(features)) %>% as.matrix() 
+fit_lasso <- glmnet(x_penalized, y_penalized, alpha = 1)     # Model alpha = 1: LASSO
+```
+
+```{r}
+lasso_res <- summary(fit_lasso$beta)                        # Extract LASSO coefs
+lambda <- fit_lasso$lambda                                  # Values of the penalisation const
+lasso_res$Lambda <- lambda[lasso_res$j]                     # Put the labels where they belong
+lasso_res$Feature <- features[lasso_res$i] %>% as.factor()  # Add names of variables to output
+lasso_res[1:153,] %>%                                       # Take the first 153 estimates
+    ggplot(aes(x = Lambda, y = x, color = Feature)) +       # Plot!
+    geom_line() + coord_fixed(0.05) + ylab("beta") +        # Change aspect ratio of graph
+    theme(legend.text = element_text(size = 7))             # Reduce legend font size
+```
+
+#Penalized TEST R2
+```{r}
+# Split the data into training and testing samples based on separation_date
+separation_date <- as.Date("2014-01-15")
+training_sample <- filter(new_data, eom < separation_date)
+testing_sample <- filter(new_data, eom >= separation_date)
+
+# Prepare the dependent variable and predictors for the training sample
+y_penalized_train <- training_sample$mkt_vw_exc
+x_penalized_train <- training_sample %>% 
+  dplyr::select(all_of(features)) %>% as.matrix()
+
+# Fit the LASSO regression model on the training sample
+fit_lasso <- glmnet(x_penalized_train, y_penalized_train, alpha = 1)
+
+# Prepare the predictors for the testing sample
+x_penalized_test <- testing_sample %>% 
+  dplyr::select(all_of(features)) %>% as.matrix()
+
+# Predict the target variable for the testing sample
+y_predicted_test <- predict(fit_lasso, newx = x_penalized_test)
+
+# Calculate the R2 coefficient for the testing sample
+r_squared <- 1 - sum((testing_sample$mkt_vw_exc - y_predicted_test)^2) / sum((testing_sample$mkt_vw_exc - mean(testing_sample$mkt_vw_exc))^2)
+
+# Print the R2 coefficient
+print(paste("R2 coefficient:", r_squared))
+
+# Create a vector to store R2 coefficients for each time point
+r_squared_over_time <- vector()
+
+# Iterate through time points in the testing sample
+for (i in 1:nrow(testing_sample)) {
+  # Prepare the predictors for the current time point
+  x_penalized_current <- x_penalized_test[i, , drop = FALSE]
+  
+  # Predict the target variable for the current time point
+  y_predicted_current <- predict(fit_lasso, newx = x_penalized_current)
+  
+  # Calculate the R2 coefficient for the current time point
+  r_squared_current <- 1 - sum((testing_sample$mkt_vw_exc[i] - y_predicted_current)^2) / sum((testing_sample$mkt_vw_exc[i] - mean(testing_sample$mkt_vw_exc))^2)
+  
+  # Store the R2 coefficient for the current time point
+  r_squared_over_time <- c(r_squared_over_time, r_squared_current)
+}
+
+# Create a dataframe with the R2 coefficients and corresponding time points
+r2_data <- data.frame(Date = testing_sample$eom, R2 = r_squared_over_time)
+
+# Plot the R2 coefficients over time
+library(ggplot2)
+ggplot(r2_data, aes(x = Date, y = R2)) +
+  geom_line() +
+  xlab("Date") +
+  ylab("R2 Coefficient")
+
+```
+
+
+
+```{r}
+# Extract coefficients from fit_lasso object
+coefficients <- as.matrix(coef(fit_lasso)[-1, ])
+
+# Calculate overall contribution
+overall_contrib <- rowSums(abs(coefficients))
+
+# Create dataframe with characteristic information
+characteristics <- data.frame(
+  Name = features,
+  Average_Rank = rowMeans(abs(coefficients)),
+  Overall_Contribution = overall_contrib
+)
+
+# Sort dataframe by average rank
+characteristics <- characteristics[order(characteristics$Average_Rank), ]
+
+# Display the characteristic importance table
+library(knitr)
+kable(characteristics, 
+      caption = "Characteristic Importance",
+      align = c("l", "r", "r"))
+
+
+```
+
+
+
+
+
+```{r}
+fit_ridge <- glmnet(x_penalized, y_penalized, alpha = 0)                  # alpha = 0: ridge
+ridge_res <- summary(fit_ridge$beta)                                      # Extract ridge coefs
+lambda <- fit_ridge$lambda                                                # Penalisation const
+ridge_res$Feature <- features[ridge_res$i] %>% as.factor()
+ridge_res$Lambda <- lambda[ridge_res$j]                                   # Set labels right
+ridge_res %>% 
+    filter(Feature %in% levels(droplevels(lasso_res$Feature[1:153]))) %>% # Keep same features 
+    ggplot(aes(x = Lambda, y = x, color = Feature)) + ylab("beta") +      # Plot!
+    geom_line() + scale_x_log10() + coord_fixed(10) +                     # Aspect ratio 
+    theme(legend.text = element_text(size = 7))
+```
+
+
+
+```{r}
+t_oos <- returns$eom[returns$eom > separation_date] %>%              # Out-of-sample dates 
+    unique() %>%                                                     # Remove duplicates
+    as.Date(origin = "1970-01-01")                                   # Transform in date format
+Tt <- length(t_oos)                                                  # Nb of dates, avoid T 
+nb_port <- 3                                                         # Nb of portfolios/strats.
+portf_weights <- array(0, dim = c(Tt, nb_port, ncol(returns) - 1))   # Initial portf. weights
+portf_returns <- matrix(0, nrow = Tt, ncol = nb_port)                # Initial portf. returns 
+```
+
+```{r}
+weights_sparsehedge <- function(returns, alpha, lambda){  # The parameters are defined here
+    w <- 0                                                # Initiate weights
+    for(i in 1:ncol(returns)){                            # Loop on the assets
+        y <- returns[,i]                                  # Dependent variable
+        x <- returns[,-i]                                 # Independent variable
+        fit <- glmnet(x,y, family = "gaussian", alpha = alpha, lambda = lambda)
+        err <- y-predict(fit, x)                          # Prediction errors
+        w[i] <- (1-sum(fit$beta))/var(err)                # Output: weight of asset i
+    }
+    return(w / sum(w))                                    # Normalisation of weights
+}
+```
+
+```{r}
+weights_multi <- function(returns,j, alpha, lambda){
+    N <- ncol(returns)
+    if(j == 1){                                    # j = 1 => EW
+        return(rep(1/N,N))
+    }
+    if(j == 2){                                    # j = 2 => Minimum Variance
+        sigma <- cov(returns) + 0.01 * diag(N)     # Covariance matrix + regularizing term
+        w <- solve(sigma) %*% rep(1,N)             # Inverse & multiply
+        return(w / sum(w))                         # Normalize
+    }
+    if(j == 3){                                    # j = 3 => Penalised / elasticnet
+        w <- weights_sparsehedge(returns, alpha, lambda)
+    }
+}
+```
+
+```{r}
+for(t in 1:length(t_oos)){                                                 # Loop = rebal. dates
+    temp_data <- returns %>%                                               # Data for weights
+        filter(eom < t_oos[t]) %>%                                         # Expand. window
+        dplyr::select(-eom) %>%
+        as.matrix() 
+    realised_returns <- returns %>%                                        # OOS returns
+        filter(eom ==  t_oos[t]) %>% 
+        dplyr::select(-eom)
+    for(j in 1:nb_port){                                                   # Loop over strats
+        portf_weights[t,j,] <- weights_multi(temp_data, j, 0.1, 0.1)       # Hard-coded params!
+        portf_returns[t,j] <- sum(portf_weights[t,j,] * realised_returns)  # Portf. returns
+    }
+}
+colnames(portf_returns) <- c("EW", "MV", "Sparse") # Colnames
+apply(portf_returns, 2, sd)                        # Portfolio volatilities (monthly scale)
+```
+
+```{r}
+y_penalized_train <- training_sample$mkt_vw_exc               # Dependent variable
+x_penalized_train <- training_sample %>%                          # Predictors
+    dplyr::select(all_of(features)) %>% as.matrix()                  
+fit_pen_pred <- glmnet(x_penalized_train, y_penalized_train,      # Model
+                       alpha = 0.1, lambda = 0.1)
+```
+
+```{r}
+x_penalized_test <- testing_sample %>%                                            # Predictors
+    dplyr::select(all_of(features)) %>% as.matrix()         
+mean((predict(fit_pen_pred, x_penalized_test) - testing_sample$mkt_vw_exc)^2) # MSE
+```
+
+```{r}
+mean(predict(fit_pen_pred, x_penalized_test) * testing_sample$mkt_vw_exc > 0) # Hit ratio
+```
+
+
+#Tree-based methods
+```{r}
+library(rpart)              # Tree package  
+library(rpart.plot)         # Tree plot package
+formula <- paste("mkt_vw_exc ~", paste(features, collapse = " + ")) # Defines the model 
+formula <- as.formula(formula)                                          # Forcing formula object
+fit_tree <- rpart(formula,
+             data = new_data,    # Data source: full sample
+             minbucket = 1000,   # Min nb of obs required in each terminal node (leaf)
+             minsplit = 2000,    # Min nb of obs required to continue splitting
+             cp = 0.0001,        # Precision: smaller = more leaves
+             maxdepth = 5        # Maximum depth (i.e. tree levels)
+             ) 
+rpart.plot(fit_tree)             # Plot the tree
+```
+
+```{r}
+predict(fit_tree, new_data[1:6,]) # Test (prediction) on the first six instances of the sample
+```
+
+```{r}
+new_data %>% ggplot() +
+    stat_smooth(aes(x = ret_1_0, y = mkt_vw_exc, color = "ret_1"), se = FALSE) +
+    stat_smooth(aes(x = be_me, y = mkt_vw_exc, color = "be_me"), se = FALSE) +
+    stat_smooth(aes(x = bidaskhl_21d, y = mkt_vw_exc, color = "BD21"), se = FALSE) +
+    xlab("Predictor") + coord_fixed(100) + labs(color = "Characteristic")
+```
+
+
+```{r}
+fit_tree2 <- rpart(formula, 
+             data = training_sample,     # Data source: training sample
+             minbucket = 1500,           # Min nb of obs required in each terminal node (leaf)
+             minsplit = 4000,            # Min nb of obs required to continue splitting
+             cp = 0.0001,                # Precision: smaller cp = more leaves
+             maxdepth = 5                # Maximum depth (i.e. tree levels)
+             ) 
+mean((predict(fit_tree2, testing_sample) - testing_sample$mkt_vw_exc)^2) # MSE
+```
+
+```{r}
+mean(predict(fit_tree2, testing_sample) * testing_sample$mkt_vw_exc > 0) # Hit ratio
+```
+
+#Random Forest
+
+```{r}
+library(randomForest) 
+set.seed(42)                                # Sets the random seed
+fit_RF <- randomForest(formula,             # Same formula as for simple trees!
+                 data = training_sample,    # Data source: training sample
+                 sampsize = 3000,           # Size of (random) sample for each tree
+                 replace = FALSE,           # Is the sampling done with replacement?
+                 nodesize = 200,            # Minimum size of terminal cluster
+                 ntree = 40,                # Nb of random trees
+                 mtry = 30                  # Nb of predictive variables for each tree
+    )
+predict(fit_RF, testing_sample[1:5,])       # Prediction over the first 5 test instances 
+```
+
+```{r}
+mean((predict(fit_RF, testing_sample) - testing_sample$mkt_vw_exc)^2) # MSE
+```
+
+```{r}
+mean(predict(fit_RF, testing_sample) * testing_sample$mkt_vw_exc > 0) # Hit ratio
+```
+
+#Extreme Gardient boosting 
+
+```{r}
+library(xgboost)                                                              # The package for boosted trees
+train_features_xgb <- training_sample %>% 
+    filter(mkt_vw_exc < quantile(mkt_vw_exc, 0.2) | 
+               mkt_vw_exc > quantile(mkt_vw_exc, 0.8)) %>%            # Extreme values only!
+    dplyr::select(all_of(features)) %>% as.matrix()                           # Independent variable
+train_label_xgb <- training_sample %>%
+    filter(mkt_vw_exc < quantile(mkt_vw_exc, 0.2) | 
+               mkt_vw_exc > quantile(mkt_vw_exc, 0.8)) %>%
+    dplyr::select(mkt_vw_exc) %>% as.matrix()                             # Dependent variable
+train_matrix_xgb <- xgb.DMatrix(data = train_features_xgb, 
+                                label = train_label_xgb)        # XGB format!
+```
+
+```{r}
+mono_const <- rep(0, length(features))  # Initialize the vector
+
+# Assign monotonicity constraints to all features
+for (i in 1:length(features)) {
+  if (features[i] != "mkt_vw_exc") {
+    mono_const[i] <- sample(c(-1, 1), 1)  # Randomly assign -1 or 1 for monotonicity direction
+  }
+}
+
+# Print the resulting monotonicity constraints
+print(mono_const)
+
+```
+
+```{r}
+fit_xgb <- xgb.train(data = train_matrix_xgb,     # Data source 
+              eta = 0.3,                          # Learning rate
+              objective = "reg:squarederror",     # Objective function
+              max_depth = 5,                      # Maximum depth of trees
+              subsample = 0.6,                    # Train on random 60% of sample
+              colsample_bytree = 0.7,             # Train on random 70% of predictors
+              lambda = 1,                         # Penalisation of leaf values
+              gamma = 0.1,                        # Penalisation of number of leaves
+              nrounds = 30,                       # Number of trees used (rather low here)
+              monotone_constraints = mono_const,  # Monotonicity constraints
+              rate_drop = 0.1,                    # Drop rate for DART
+              verbose = 0                         # No comment from the algo 
+    )
+```
+
+```{r}
+xgb_test <- testing_sample %>%                                # Test sample => XGB format
+    dplyr::select(all_of(features)) %>% 
+    as.matrix() 
+mean((predict(fit_xgb, xgb_test) - testing_sample$mkt_vw_exc)^2) # MSE
+```
+
+```{r}
+mean(predict(fit_xgb, xgb_test) * testing_sample$mkt_vw_exc > 0) # Hit ratio
+```
+
+#Instalation of NN on the computer
+```{r}
+install.packages("keras")
+install.packages("tensorflow")
+```
+
+```{r}
+library(keras)
+```
+
+```{r}
+library(tensorflow)
+use_backend("tensorflow")
+```
+
+#Neural Network (NN)
+```{r}
+NN_train_features <- dplyr::select(training_sample, features) %>%    # Training features
+  as.matrix()                                                      # Matrix = important
+NN_train_labels <- training_sample$mkt_vw_exc                           # Training labels
+NN_test_features <- dplyr::select(testing_sample, features) %>%      # Testing features
+  as.matrix()                                                      # Matrix = important
+NN_test_labels <- testing_sample$mkt_vw_exc                            # Testing labels
+```
+
+```{r}
+model <- keras_model_sequential()
+model %>%   # This defines the structure of the network, i.e. how layers are organized
+  layer_dense(units = 16, activation = 'relu', input_shape = ncol(NN_train_features)) %>%
+  layer_dense(units = 8, activation = 'tanh') %>%
+  layer_dense(units = 1) # No activation means linear activation: f(x) = x.
+```
+
+
+
+
+
+
+
+
+
+
+
